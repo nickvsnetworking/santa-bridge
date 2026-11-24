@@ -1,5 +1,7 @@
 # santa-bridge
 
+The full story of this project is on the blog: [Payphone Christmas Project](https://nickvsnetworking.com/payphone-christmas-project/).
+
 A phone line to Santa. `santa-bridge` answers a SIP call and connects the caller to an
 OpenAI GPT-Live voice session playing Father Christmas, so a child can pick up a phone,
 dial a number and have a real conversation with Santa.
