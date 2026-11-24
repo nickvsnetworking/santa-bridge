@@ -1,0 +1,15 @@
+[Unit]
+Description=Santa line: SIP to OpenAI GPT-Live bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=santa
+Group=santa
+ExecStart=/opt/santa-bridge/venv/bin/python /opt/santa-bridge/santa_bridge.py
+Restart=always
+RestartSec=3
+StateDirectory=santa-bridge
+
+[Install]
+WantedBy=multi-user.target

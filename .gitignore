@@ -1,0 +1,4 @@
+config.json
+transcripts/
+venv/
+__pycache__/
