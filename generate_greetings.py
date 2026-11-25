@@ -41,6 +41,7 @@ async def record(cfg, text):
         },
     }
     audio = bytearray()
+    said = []
     async with websockets.connect(LIVE_URL, additional_headers={
             "Authorization": f"Bearer {cfg['api_key']}"}, max_size=None) as ws:
         await ws.send(json.dumps(start))
@@ -70,12 +71,14 @@ async def record(cfg, text):
                         break
                     if frames > MAX_FRAMES:
                         sys.exit(f"no complete greeting after {MAX_FRAMES // 50} s: {text!r}")
+                elif t == "session.output_transcript.delta":
+                    said.append(ev.get("delta", ""))
                 elif t == "error":
                     sys.exit(f"openai error: {json.dumps(ev.get('error'))}")
         finally:
             feeder.cancel()
             await ws.send(json.dumps({"type": "session.close"}))
-    return bytes(audio[max(0, first - 5) * FRAME:(last + 15) * FRAME])
+    return bytes(audio[max(0, first - 5) * FRAME:(last + 15) * FRAME]), "".join(said).strip()
 
 
 async def main():
@@ -83,11 +86,11 @@ async def main():
     os.makedirs(GREETING_DIR, exist_ok=True)
     manifest = {}
     for i, text in enumerate(cfg["greetings"]):
-        audio = await record(cfg, text)
+        audio, said = await record(cfg, text)
         with open(greeting_path(i), "wb") as f:
             f.write(audio)
         manifest[str(i)] = {"text": text, "voice": cfg["voice"]}
-        print(f"greeting {i}: {len(audio) / 8000:.1f} s -> {greeting_path(i)}", flush=True)
+        print(f"greeting {i}: {len(audio) / 8000:.1f} s -> {greeting_path(i)}\n  said: {said}", flush=True)
     with open(GREETING_MANIFEST, "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"wrote {GREETING_MANIFEST}")
