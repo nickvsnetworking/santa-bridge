@@ -22,7 +22,8 @@ LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 PT_NAME = {0: "PCMU", 8: "PCMA"}
 SILENCE = {0: 0xFF, 8: 0xD5}
 OPENAI_READY_TIMEOUT = 15
-RING_SECONDS = 6
+RING_SECONDS = 4
+PAUSE_SECONDS = 1
 MFC_DIGITS = "00464646"
 GREETING_DIR = "/var/lib/santa-bridge/greetings"
 GREETING_MANIFEST = os.path.join(GREETING_DIR, "greetings.json")
@@ -275,15 +276,14 @@ class Call:
             log(self.call_id, "ended after", int(time.monotonic() - self.started), "s")
 
     async def connect_tones(self):
-        self.out_q += encode(mfc_samples(MFC_DIGITS), self.pt)
         cycle = encode(ringback_cycle(), self.pt)
-        ring_until = time.monotonic() + len(self.out_q) / 8000 + RING_SECONDS
+        self.out_q += encode(mfc_samples(MFC_DIGITS), self.pt) + (cycle * 2)[:8000 * RING_SECONDS]
         give_up = time.monotonic() + OPENAI_READY_TIMEOUT
         while not self.ended:
-            if len(self.out_q) < 1600:
+            if len(self.out_q) < 160:
+                if self.openai_ready.is_set():
+                    break
                 self.out_q += cycle
-            if time.monotonic() >= ring_until and self.openai_ready.is_set():
-                break
             if time.monotonic() >= give_up:
                 log(self.call_id, "openai not ready after", OPENAI_READY_TIMEOUT, "s")
                 if self.ws is not None:
@@ -293,7 +293,8 @@ class Call:
         if self.ended:
             return
         greeting = self.cfg["greeting_audio"][self.greeting_idx]
-        self.out_q[:] = greeting if self.pt == 0 else greeting.translate(ULAW_TO_ALAW)
+        self.out_q += encode(silence(PAUSE_SECONDS), self.pt)
+        self.out_q += greeting if self.pt == 0 else greeting.translate(ULAW_TO_ALAW)
         self.live = True
         self.add_transcript("santa", self.cfg["greetings"][self.greeting_idx])
         log(self.call_id, "santa on the line, greeting", self.greeting_idx,
