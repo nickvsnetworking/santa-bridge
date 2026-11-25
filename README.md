@@ -20,7 +20,9 @@ and the example config holds the Norfolk Island prompts and greetings.
   ACK, BYE, CANCEL, OPTIONS) and RTP itself. One call at a time; a second caller gets
   `486 Busy Here`.
 - Passes G.711 audio straight through to GPT-Live in both directions, with no transcoding.
-- Greets each caller with the next greeting in the list, in rotation.
+- Plays R2 MFC signalling tones and ringback as early media while GPT-Live connects, then
+  answers and plays the next greeting at once, from a recording made with
+  `generate_greetings.py` in the same voice. Greetings are used in rotation.
 - Barge-in: when the caller talks over Santa, queued Santa audio is dropped
   (`barge_in_rms`), so he stops and listens.
 - Says a warm goodbye at `goodbye_at_seconds` and hangs up at `max_call_seconds`.
@@ -38,6 +40,9 @@ sudo /opt/santa-bridge/venv/bin/pip install -r requirements.txt
 sudo install -d -o root -g santa -m 750 /etc/santa-bridge
 sudo install -o root -g santa -m 640 config.example.json /etc/santa-bridge/config.json
 sudoedit /etc/santa-bridge/config.json      # set api_key, sip_ip and voice
+
+sudo cp generate_greetings.py /opt/santa-bridge/
+cd /opt/santa-bridge && sudo -u santa venv/bin/python generate_greetings.py   # again after changing greetings or voice
 
 sudo cp santa-bridge.service /etc/systemd/system/
 sudo systemctl daemon-reload

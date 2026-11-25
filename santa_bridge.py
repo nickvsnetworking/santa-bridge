@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import math
 import os
 import random
 import re
@@ -20,9 +21,18 @@ REQUIRED = ["api_key", "sip_ip", "sip_port", "rtp_port", "voice", "voice_descrip
 LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 PT_NAME = {0: "PCMU", 8: "PCMA"}
 SILENCE = {0: 0xFF, 8: 0xD5}
+OPENAI_READY_TIMEOUT = 15
+RING_SECONDS = 6
+MFC_DIGITS = "00464646"
+GREETING_DIR = "/var/lib/santa-bridge/greetings"
+GREETING_MANIFEST = os.path.join(GREETING_DIR, "greetings.json")
 
 
-def load_config():
+def greeting_path(idx):
+    return os.path.join(GREETING_DIR, f"greeting_{idx}.ulaw")
+
+
+def load_config(check_greeting_audio=True):
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     missing = [k for k in REQUIRED if k not in cfg]
@@ -30,16 +40,32 @@ def load_config():
         sys.exit(f"{CONFIG_PATH}: missing required keys: {', '.join(missing)}")
     if not cfg["greetings"]:
         sys.exit(f"{CONFIG_PATH}: greetings must list at least one greeting")
+    if check_greeting_audio:
+        cfg["greeting_audio"] = load_greeting_audio(cfg)
     return cfg
+
+
+def load_greeting_audio(cfg):
+    fix = "run generate_greetings.py after changing greetings or voice"
+    if not os.path.exists(GREETING_MANIFEST):
+        sys.exit(f"{GREETING_MANIFEST} missing: {fix}")
+    manifest = json.load(open(GREETING_MANIFEST))
+    audio = []
+    for i, text in enumerate(cfg["greetings"]):
+        entry = manifest.get(str(i))
+        if not entry or entry["text"] != text or entry["voice"] != cfg["voice"]:
+            sys.exit(f"{greeting_path(i)} does not match greeting {i} and voice in {CONFIG_PATH}: {fix}")
+        audio.append(open(greeting_path(i), "rb").read())
+    return audio
 
 
 def next_greeting(cfg):
     path = cfg["greeting_index_file"]
     idx = int(open(path).read().strip()) if os.path.exists(path) else 0
-    greeting = cfg["greetings"][idx % len(cfg["greetings"])]
+    idx %= len(cfg["greetings"])
     with open(path, "w") as f:
         f.write(str((idx + 1) % len(cfg["greetings"])))
-    return greeting
+    return idx
 
 
 def ulaw_to_lin(b):
@@ -57,7 +83,61 @@ def alaw_to_lin(b):
     return t if (b & 0x80) else -t
 
 
+def lin_to_ulaw(s):
+    sign = 0x80 if s < 0 else 0
+    s = min(abs(s), 32635) + 0x84
+    exp = (s >> 7).bit_length() - 1
+    return ~(sign | (exp << 4) | ((s >> (exp + 3)) & 0x0F)) & 0xFF
+
+
+def lin_to_alaw(s):
+    mask = 0xD5 if s >= 0 else 0x55
+    s = min(s if s >= 0 else -s - 1, 32767)
+    if s < 256:
+        aval = s >> 4
+    else:
+        seg = (s >> 8).bit_length()
+        aval = (seg << 4) | ((s >> (seg + 3)) & 0x0F)
+    return aval ^ mask
+
+
 DECODE = {0: [ulaw_to_lin(i) for i in range(256)], 8: [alaw_to_lin(i) for i in range(256)]}
+ULAW_TO_ALAW = bytes(lin_to_alaw(ulaw_to_lin(i)) for i in range(256))
+ENCODE = {0: lin_to_ulaw, 8: lin_to_alaw}
+
+# R2 MFC: forward digits are two of 1380-1980 Hz; backward A-1 "send next digit" is 1140+1020 Hz.
+MFC_FORWARD = {"1": (1380, 1500), "2": (1380, 1620), "3": (1500, 1620), "4": (1380, 1740),
+               "5": (1500, 1740), "6": (1620, 1740), "7": (1380, 1860), "8": (1500, 1860),
+               "9": (1620, 1860), "0": (1740, 1860)}
+MFC_SEND_NEXT = (1140, 1020)
+MFC_ADDRESS_COMPLETE = (1140, 900)
+
+
+def tone(freqs, seconds, level=6000):
+    n = int(8000 * seconds)
+    return [int(sum(level * math.sin(2 * math.pi * f * i / 8000) for f in freqs) / len(freqs))
+            for i in range(n)]
+
+
+def silence(seconds):
+    return [0] * int(8000 * seconds)
+
+
+def mfc_samples(digits):
+    s = silence(0.3)
+    for d in digits:
+        s += tone(MFC_FORWARD[d], 0.07) + tone(MFC_SEND_NEXT, 0.06) + silence(0.03)
+    return s + tone(MFC_ADDRESS_COMPLETE, 0.1) + silence(0.4)
+
+
+def ringback_cycle():
+    ring = tone((400, 450), 0.4, 4000)
+    return ring + silence(0.2) + ring + silence(2.0)
+
+
+def encode(samples, pt):
+    enc = ENCODE[pt]
+    return bytes(enc(x) for x in samples)
 
 
 def rms(payload, pt):
@@ -111,6 +191,9 @@ class Call:
         self.started = time.monotonic()
         self.ws = None
         self.last_rx = 0.0
+        self.answered = False
+        self.openai_ready = asyncio.Event()
+        self.greeting_idx = next_greeting(self.cfg)
 
     def parse_sdp(self):
         ip = port = None
@@ -172,11 +255,13 @@ class Call:
             log(self.call_id, "no PCMU/PCMA offered")
             return
         self.pt, self.remote_rtp = pt, (ip, port)
+        sdp = self.answer_sdp()
         self.bridge.sip.sendto(self.response(100, "Trying"), self.addr)
-        self.bridge.sip.sendto(self.response(200, "OK", self.answer_sdp()), self.addr)
-        log(self.call_id, "answered", PT_NAME[pt], "rtp->", self.remote_rtp,
+        self.bridge.sip.sendto(self.response(183, "Session Progress", sdp), self.addr)
+        log(self.call_id, "early media", PT_NAME[pt], "rtp->", self.remote_rtp,
             "from", self.invite.get("From"))
-        tasks = [asyncio.create_task(self.rtp_sender())]
+        tasks = [asyncio.create_task(self.rtp_sender()),
+                 asyncio.create_task(self.answer_when_ready(sdp))]
         try:
             await self.openai_session(tasks)
         except Exception as e:
@@ -184,17 +269,48 @@ class Call:
         finally:
             for t in tasks:
                 t.cancel()
-            if not self.ended:
+            if not self.answered and not self.ended:
+                self.ended = True
+                self.bridge.sip.sendto(self.response(503, "Service Unavailable"), self.addr)
+                log(self.call_id, "rejected 503: openai not ready")
+            elif not self.ended:
                 self.ended = True
                 self.send_bye()
             self.write_transcript()
             log(self.call_id, "ended after", int(time.monotonic() - self.started), "s")
 
+    async def answer_when_ready(self, sdp):
+        self.out_q += encode(mfc_samples(MFC_DIGITS), self.pt)
+        cycle = encode(ringback_cycle(), self.pt)
+        ring_until = time.monotonic() + len(self.out_q) / 8000 + RING_SECONDS
+        give_up = time.monotonic() + OPENAI_READY_TIMEOUT
+        while not self.ended:
+            if len(self.out_q) < 1600:
+                self.out_q += cycle
+            if time.monotonic() >= ring_until and self.openai_ready.is_set():
+                break
+            if time.monotonic() >= give_up:
+                log(self.call_id, "openai not ready after", OPENAI_READY_TIMEOUT, "s")
+                if self.ws is not None:
+                    asyncio.create_task(self.close_ws())
+                return
+            await asyncio.sleep(0.05)
+        if self.ended:
+            return
+        greeting = self.cfg["greeting_audio"][self.greeting_idx]
+        self.out_q[:] = greeting if self.pt == 0 else greeting.translate(ULAW_TO_ALAW)
+        self.answered = True
+        self.bridge.sip.sendto(self.response(200, "OK", sdp), self.addr)
+        self.add_transcript("santa", self.cfg["greetings"][self.greeting_idx])
+        log(self.call_id, "answered, greeting", self.greeting_idx,
+            f"after {time.monotonic() - self.started:.1f} s")
+
     async def openai_session(self, tasks):
         cfg = self.cfg
         fmt = {"type": "audio/pcmu" if self.pt == 0 else "audio/pcma", "rate": 8000}
-        greeting = ("Greet the caller now in English, in character as Santa, saying close to this: "
-                    f"\"{next_greeting(cfg)}\" Then pause and listen.")
+        greeting = ("You have already answered the phone and greeted the caller in English with: "
+                    f"\"{cfg['greetings'][self.greeting_idx]}\" Do not greet again. Wait for the "
+                    "caller to answer, then reply in English, in character as Santa.")
         instructions = cfg["instructions"]
         if cfg["voice_description"]:
             instructions += "\n\nVoice: " + cfg["voice_description"]
@@ -219,12 +335,11 @@ class Call:
                 t = ev.get("type")
                 if t == "session.started":
                     log(self.call_id, "openai session", ev.get("session", {}).get("id"))
-                    await ws.send(json.dumps({"type": "session.commentary.append",
-                                              "event_id": "greet", "delegation_id": None,
-                                              "content": greeting}))
+                    self.openai_ready.set()
                     tasks.append(asyncio.create_task(self.timer(ws)))
                 elif t == "session.output_audio.delta":
-                    self.out_q += base64.b64decode(ev["delta"])
+                    if self.answered:
+                        self.out_q += base64.b64decode(ev["delta"])
                 elif t == "session.input_transcript.delta":
                     self.add_transcript("child", ev.get("delta", ""))
                 elif t == "session.output_transcript.delta":
@@ -239,6 +354,8 @@ class Call:
 
     async def timer(self, ws):
         cfg = self.cfg
+        while not self.answered and not self.ended:
+            await asyncio.sleep(0.1)
         await asyncio.sleep(cfg["goodbye_at_seconds"])
         if self.ended:
             return
@@ -288,6 +405,8 @@ class Call:
             return
         cc = data[0] & 0x0F
         payload = data[12 + 4 * cc:]
+        if not self.answered:
+            return
         self.last_rx = time.monotonic()
         if self.out_q:
             self.loud_frames = self.loud_frames + 1 if rms(payload, self.pt) > self.cfg["barge_in_rms"] else 0
@@ -377,8 +496,13 @@ class Bridge:
                     asyncio.create_task(cur.close_ws())
         elif msg.method == "CANCEL":
             self.reply(msg, addr, 200, "OK")
-            if cur:
+            if cur and not cur.ended:
                 cur.ended = True
+                if not cur.answered:
+                    self.sip.sendto(cur.response(487, "Request Terminated"), cur.addr)
+                    log(cid, "caller cancelled while ringing")
+                if cur.ws is not None:
+                    asyncio.create_task(cur.close_ws())
         elif msg.method == "OPTIONS":
             self.reply(msg, addr, 200, "OK")
         elif msg.method != "ACK":
