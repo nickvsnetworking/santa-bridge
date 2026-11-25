@@ -191,7 +191,7 @@ class Call:
         self.started = time.monotonic()
         self.ws = None
         self.last_rx = 0.0
-        self.answered = False
+        self.live = False
         self.openai_ready = asyncio.Event()
         self.greeting_idx = next_greeting(self.cfg)
 
@@ -255,13 +255,12 @@ class Call:
             log(self.call_id, "no PCMU/PCMA offered")
             return
         self.pt, self.remote_rtp = pt, (ip, port)
-        sdp = self.answer_sdp()
         self.bridge.sip.sendto(self.response(100, "Trying"), self.addr)
-        self.bridge.sip.sendto(self.response(183, "Session Progress", sdp), self.addr)
-        log(self.call_id, "early media", PT_NAME[pt], "rtp->", self.remote_rtp,
+        self.bridge.sip.sendto(self.response(200, "OK", self.answer_sdp()), self.addr)
+        log(self.call_id, "answered", PT_NAME[pt], "rtp->", self.remote_rtp,
             "from", self.invite.get("From"))
         tasks = [asyncio.create_task(self.rtp_sender()),
-                 asyncio.create_task(self.answer_when_ready(sdp))]
+                 asyncio.create_task(self.connect_tones())]
         try:
             await self.openai_session(tasks)
         except Exception as e:
@@ -269,17 +268,13 @@ class Call:
         finally:
             for t in tasks:
                 t.cancel()
-            if not self.answered and not self.ended:
-                self.ended = True
-                self.bridge.sip.sendto(self.response(503, "Service Unavailable"), self.addr)
-                log(self.call_id, "rejected 503: openai not ready")
-            elif not self.ended:
+            if not self.ended:
                 self.ended = True
                 self.send_bye()
             self.write_transcript()
             log(self.call_id, "ended after", int(time.monotonic() - self.started), "s")
 
-    async def answer_when_ready(self, sdp):
+    async def connect_tones(self):
         self.out_q += encode(mfc_samples(MFC_DIGITS), self.pt)
         cycle = encode(ringback_cycle(), self.pt)
         ring_until = time.monotonic() + len(self.out_q) / 8000 + RING_SECONDS
@@ -299,10 +294,9 @@ class Call:
             return
         greeting = self.cfg["greeting_audio"][self.greeting_idx]
         self.out_q[:] = greeting if self.pt == 0 else greeting.translate(ULAW_TO_ALAW)
-        self.answered = True
-        self.bridge.sip.sendto(self.response(200, "OK", sdp), self.addr)
+        self.live = True
         self.add_transcript("santa", self.cfg["greetings"][self.greeting_idx])
-        log(self.call_id, "answered, greeting", self.greeting_idx,
+        log(self.call_id, "santa on the line, greeting", self.greeting_idx,
             f"after {time.monotonic() - self.started:.1f} s")
 
     async def openai_session(self, tasks):
@@ -338,7 +332,7 @@ class Call:
                     self.openai_ready.set()
                     tasks.append(asyncio.create_task(self.timer(ws)))
                 elif t == "session.output_audio.delta":
-                    if self.answered:
+                    if self.live:
                         self.out_q += base64.b64decode(ev["delta"])
                 elif t == "session.input_transcript.delta":
                     self.add_transcript("child", ev.get("delta", ""))
@@ -354,7 +348,7 @@ class Call:
 
     async def timer(self, ws):
         cfg = self.cfg
-        while not self.answered and not self.ended:
+        while not self.live and not self.ended:
             await asyncio.sleep(0.1)
         await asyncio.sleep(cfg["goodbye_at_seconds"])
         if self.ended:
@@ -405,7 +399,7 @@ class Call:
             return
         cc = data[0] & 0x0F
         payload = data[12 + 4 * cc:]
-        if not self.answered:
+        if not self.live:
             return
         self.last_rx = time.monotonic()
         if self.out_q:
@@ -496,13 +490,8 @@ class Bridge:
                     asyncio.create_task(cur.close_ws())
         elif msg.method == "CANCEL":
             self.reply(msg, addr, 200, "OK")
-            if cur and not cur.ended:
+            if cur:
                 cur.ended = True
-                if not cur.answered:
-                    self.sip.sendto(cur.response(487, "Request Terminated"), cur.addr)
-                    log(cid, "caller cancelled while ringing")
-                if cur.ws is not None:
-                    asyncio.create_task(cur.close_ws())
         elif msg.method == "OPTIONS":
             self.reply(msg, addr, 200, "OK")
         elif msg.method != "ACK":

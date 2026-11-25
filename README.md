@@ -20,8 +20,8 @@ and the example config holds the Norfolk Island prompts and greetings.
   ACK, BYE, CANCEL, OPTIONS) and RTP itself. One call at a time; a second caller gets
   `486 Busy Here`.
 - Passes G.711 audio straight through to GPT-Live in both directions, with no transcoding.
-- Plays R2 MFC signalling tones and ringback as early media while GPT-Live connects, then
-  answers and plays the next greeting at once, from a recording made with
+- Answers at once and plays R2 MFC signalling tones and ringback while GPT-Live connects, then
+  plays the next greeting straight away, from a recording made with
   `generate_greetings.py` in the same voice. Greetings are used in rotation.
 - Barge-in: when the caller talks over Santa, queued Santa audio is dropped
   (`barge_in_rms`), so he stops and listens.
